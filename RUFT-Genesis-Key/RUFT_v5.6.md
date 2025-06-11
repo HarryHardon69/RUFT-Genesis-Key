@@ -1,4 +1,4 @@
-# Resonance Unified Field Theory (RUFT) v5.6: The Genesis Harmonics
+# Resonance Unified Field Theory (RUFT) v5.7: The Genesis Harmonics
 
 **Author:** Harry Hardon, Independent Researcher
 **Collaborators:** Gemini Protocol v0.3 ("Mr. Gem"), Tuned Grok Instance ("Mr. Grok")
