@@ -1,219 +1,126 @@
-# RUFT-Genesis-Key/analysis/analysis_gw.py
-
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.signal import welch, find_peaks
+import h5py
 import os
+import argparse
+import matplotlib.pyplot as plt
+from scipy.signal import welch
+from astropy import constants as const
+from astropy import units as u
 
-# --- Configuration ---
-DATA_DIR = "../simulations" # Data source
-# Assuming there might be specific data files for "GW" analysis, e.g., from the 3D sim
-# For now, let's assume we might use aggregate data like total active cells from 3D
-ACTIVE_HISTORY_FILE_3D = "3D_active_history.npy"
-# Or, a dedicated file for "field strength" or similar if the simulation produces it.
-# GW_DATA_FILE = "3D_gw_potential_field.npy"
+# --- Configuration & Constants ---
+G_SI = const.G
+C_SI = const.c
+R_OBSERVER_SI = 1 * u.kpc
 
-# Plotting preferences
-plt.style.use('seaborn-v0_8-whitegrid')
-FIGURE_SIZE_SINGLE = (12, 7)
-FONT_SIZE_TITLE = 16
-FONT_SIZE_LABEL = 12
-FONT_SIZE_LEGEND = 10
-
-# Analysis parameters for PSD (Power Spectral Density)
-PSD_SEGMENT_LENGTH = 256 # Length of segments for Welch's method
-PSD_OVERLAP_FACTOR = 0.5 # Overlap factor for segments
-
-def load_gw_data(data_dir, filename):
-    """Loads data potentially relevant for GW-like analysis."""
-    path = os.path.join(data_dir, filename)
-    if not os.path.exists(path):
-        print(f"Error: GW data file not found: {path}")
-        return None
+# --- Data Loading & Processing (Polished) ---
+def load_sim_data(filepath):
+    """Loads all necessary data from a RUFT simulation HDF5 file."""
+    print(f"--- Loading data from {filepath} ---")
     try:
-        data = np.load(path)
-        print(f"Successfully loaded GW-relevant data: {filename}")
-        return data
+        with h5py.File(filepath, 'r') as f:
+            p = dict(f['/SIMULATION_PARAMETERS'].attrs)
+            x = f['/MESH_DATA/x_grid'][:]
+            y = f['/MESH_DATA/y_grid'][:]
+            time_history = f['/time_history'][:]
+
+            timesteps_group = f['/TIMESTEPS']
+            ts_keys = sorted(timesteps_group.keys(), key=int)
+
+            if not ts_keys:
+                print("ERROR: No timestep data found in the HDF5 file.")
+                return None, None, None, None, None
+
+            print(f"Found {len(ts_keys)} saved timesteps.")
+
+            U_list = []
+            data_is_complete = True
+            for ts_key in ts_keys:
+                # Check if the required 'U' dataset exists
+                if f'{ts_key}/fields/U' in timesteps_group:
+                    U_list.append(timesteps_group[f'{ts_key}/fields/U'][:])
+                else:
+                    data_is_complete = False
+                    break # Exit loop if data is missing
+
+            if not data_is_complete:
+                # --- THIS IS THE CONDITIONAL WARNING ---
+                print("\n*** WARNING: Full U-field time series not found in this HDF5 file. ***")
+                print("This analysis will proceed by RECONSTRUCTING a mock U-field.")
+                print("This is NOT a physically rigorous result and only tests the analysis pipeline.\n")
+
+                initial_rho = 0.1 * p['rho_0'] * np.exp(-((np.meshgrid(x, y, indexing='ij')[0] - p['Lx']/2)**2 +
+                                                       (np.meshgrid(x, y, indexing='ij')[1] - p['Ly']/2)**2) / (p['Lx']/8)**2)
+                tau_E_hist = f['/tau_E_history'][:]
+                amplitude_modulation = tau_E_hist / np.max(tau_E_hist) if np.max(tau_E_hist) > 0 else np.zeros_like(tau_E_hist)
+                U_series = np.array([initial_rho * amp * np.cos(p['omega'] * t) for t, amp in zip(time_history, amplitude_modulation)])
+            else:
+                print("Full U-field time series loaded successfully.")
+                U_series = np.array(U_list)
+
+            return U_series, x, y, time_history, p
+
     except Exception as e:
-        print(f"Error loading GW data from {filename}: {e}")
-        return None
+        print(f"An unexpected error occurred while loading the data: {e}")
+        return None, None, None, None, None
 
-def plot_power_spectral_density(timeseries_data, data_name, sampling_rate=1.0, filename_prefix="GW"):
-    """
-    Calculates and plots the Power Spectral Density (PSD) of a timeseries.
-    Sampling rate is 1.0 assuming data is per time step.
-    """
-    if timeseries_data is None or len(timeseries_data) < PSD_SEGMENT_LENGTH:
-        print(f"Not enough data for PSD analysis of {data_name}. Minimum {PSD_SEGMENT_LENGTH} points needed.")
-        return
+# ... (The rest of the functions: calculate_quadrupole_moment, calculate_gw_strain, plot_gw_results are identical)
+def calculate_quadrupole_moment(U_series, x, y, p):
+    print("Calculating time-varying quadrupole moment...")
+    dx, dy = p['dx'], p['dy']
+    q_ij = np.zeros((U_series.shape[0], 2, 2))
+    X, Y = np.meshgrid(x, y, indexing='ij')
+    ENERGY_DENSITY_FACTOR = 1e-5
+    I_xx = np.sum(U_series * ENERGY_DENSITY_FACTOR * X**2, axis=(1, 2)) * dx * dy
+    I_yy = np.sum(U_series * ENERGY_DENSITY_FACTOR * Y**2, axis=(1, 2)) * dx * dy
+    I_xy = np.sum(U_series * ENERGY_DENSITY_FACTOR * X*Y, axis=(1, 2)) * dx * dy
+    q_ij[:, 0, 0] = I_xx; q_ij[:, 1, 1] = I_yy; q_ij[:, 0, 1] = q_ij[:, 1, 0] = I_xy
+    return q_ij
 
-    nperseg = min(PSD_SEGMENT_LENGTH, len(timeseries_data))
-    noverlap = int(nperseg * PSD_OVERLAP_FACTOR)
+def calculate_gw_strain(q_ij, times):
+    print("Calculating gravitational wave strain h(t)...")
+    if len(times) < 3: return None, None
+    dt = np.mean(np.diff(times));
+    if dt == 0: return None, None
+    q_dot = np.gradient(q_ij, dt, axis=0); q_ddot = np.gradient(q_dot, dt, axis=0)
+    prefactor = (G_SI.value / (C_SI.value**4 * R_OBSERVER_SI.to(u.m).value))
+    h_plus = prefactor * (q_ddot[:, 0, 0] - q_ddot[:, 1, 1])
+    h_cross = prefactor * (2 * q_ddot[:, 0, 1])
+    return h_plus, h_cross
 
-    frequencies, psd = welch(timeseries_data - np.mean(timeseries_data), # Detrend
-                               fs=sampling_rate,
-                               nperseg=nperseg,
-                               noverlap=noverlap)
+def plot_gw_results(times, h_plus, h_cross, run_id):
+    print("Generating GW plots...")
+    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    fig.suptitle(f"RUFT Predicted Gravitational Wave Signature\nRun ID: {run_id}", fontsize=16)
+    axes[0].set_title(f"Waveform as seen at {R_OBSERVER_SI.to(u.kpc):.1f}")
+    axes[0].plot(times, h_plus, label='h_plus polarization'); axes[0].plot(times, h_cross, label='h_cross polarization', alpha=0.7)
+    axes[0].set_xlabel("Time (s)"); axes[0].set_ylabel("Strain (h)"); axes[0].grid(True, linestyle='--'); axes[0].legend()
+    fs = 1.0 / np.mean(np.diff(times))
+    freqs, psd_plus = welch(h_plus, fs=fs, nperseg=len(h_plus)//4 if len(h_plus) > 8 else len(h_plus))
+    char_strain = np.sqrt(freqs * psd_plus)
+    axes[1].loglog(freqs, char_strain)
+    axes[1].set_xlabel("Frequency (Hz)"); axes[1].set_ylabel("Characteristic Strain (h_c)")
+    axes[1].set_title("Frequency Spectrum"); axes[1].grid(True, which="both", ls="--")
+    axes[1].set_xlim(left=1, right=fs/2 if fs > 2 else 2); axes[1].set_ylim(bottom=1e-25)
+    output_dir = "VISUALIZATION/notebooks/"
+    plot_filename = os.path.join(output_dir, f"gw_analysis_{run_id}.png")
+    plt.tight_layout(rect=[0, 0, 1, 0.95]); plt.savefig(plot_filename)
+    print(f"GW analysis plot saved to '{plot_filename}'")
+    plt.show()
 
-    plt.figure(figsize=FIGURE_SIZE_SINGLE)
-    plt.semilogy(frequencies, psd, color='crimson')
-    plt.title(f'{filename_prefix} - Power Spectral Density of {data_name}', fontsize=FONT_SIZE_TITLE)
-    plt.xlabel('Frequency (cycles/time step)', fontsize=FONT_SIZE_LABEL)
-    plt.ylabel('PSD (Power/Frequency Unit)', fontsize=FONT_SIZE_LABEL)
-    plt.grid(True, which="both", ls="-", alpha=0.7)
-
-    # Highlight dominant frequencies
-    peaks, _ = find_peaks(psd, prominence=np.max(psd)/10) # Prominence relative to max power
-    if len(peaks) > 0:
-        plt.plot(frequencies[peaks], psd[peaks], "x", color='blue', markersize=8, label=f'Dominant Frequencies ({len(peaks)})')
-        print(f"Dominant frequencies for {data_name} (from PSD peaks): {frequencies[peaks]}")
-    plt.legend(fontsize=FONT_SIZE_LEGEND)
-
-    plt.savefig(f"{filename_prefix}_psd_{data_name.lower().replace(' ', '_')}.png")
-    print(f"Saved PSD plot for {data_name} to {filename_prefix}_psd_{data_name.lower().replace(' ', '_')}.png")
-    plt.close()
-    return frequencies, psd
-
-def analyze_gw_patterns(data_source_1, data_source_2=None, source_names=["Source1", "Source2"], filename_prefix="GW_Pattern"):
-    """
-    Placeholder for analyzing patterns that might be metaphorically GW-like.
-    This could involve looking for propagating waves, synchronized bursts, etc.
-    For now, this might involve cross-correlation if two relevant time series are provided.
-    """
-    if data_source_1 is None:
-        print("Primary data source for GW pattern analysis is missing.")
-        return
-
-    print(f"\n--- GW Pattern Analysis ({filename_prefix}) ---")
-    print(f"Analyzing {source_names[0]}...")
-    # Example: Autocorrelation of the primary source (similar to periodicity)
-    # (Code adapted from 1D analysis)
-    if len(data_source_1) > 20: # Min length for meaningful autocorrelation
-        detrended_data = data_source_1 - np.mean(data_source_1)
-        autocorr = correlate(detrended_data, detrended_data, mode='full')
-        autocorr = autocorr[len(autocorr)//2:]
-        if np.var(detrended_data) > 1e-6:
-            autocorr /= (np.var(detrended_data) * len(detrended_data))
-        else:
-            autocorr = np.ones_like(autocorr)
-
-        lags = np.arange(len(autocorr))
-        plt.figure(figsize=FIGURE_SIZE_SINGLE)
-        plt.plot(lags[:CORR_LAG_MAX], autocorr[:CORR_LAG_MAX], label=f'Autocorrelation of {source_names[0]}', color='indigo')
-        plt.title(f'{filename_prefix} - Autocorrelation of {source_names[0]}', fontsize=FONT_SIZE_TITLE)
-        plt.xlabel('Lag', fontsize=FONT_SIZE_LABEL)
-        plt.ylabel('Normalized Autocorrelation', fontsize=FONT_SIZE_LABEL)
-        plt.legend(fontsize=FONT_SIZE_LEGEND)
-        plt.savefig(f"{filename_prefix}_autocorr_{source_names[0].lower()}.png")
-        plt.close()
-        print(f"Saved autocorrelation for {source_names[0]}.")
-
-
-    if data_source_1 is not None and data_source_2 is not None:
-        print(f"Analyzing cross-correlation between {source_names[0]} and {source_names[1]}...")
-        if len(data_source_1) != len(data_source_2):
-            print("Error: Data sources for cross-correlation must have the same length.")
-            # Optionally, truncate to the shorter length if appropriate for the analysis
-            # min_len = min(len(data_source_1), len(data_source_2))
-            # data_source_1 = data_source_1[:min_len]
-            # data_source_2 = data_source_2[:min_len]
-            return
-
-        detrended_1 = data_source_1 - np.mean(data_source_1)
-        detrended_2 = data_source_2 - np.mean(data_source_2)
-
-        # Ensure variance is not zero before normalizing
-        std_1 = np.std(detrended_1)
-        std_2 = np.std(detrended_2)
-
-        if std_1 < 1e-6 or std_2 < 1e-6:
-            print("One or both data sources have near-zero variance. Cross-correlation may not be meaningful.")
-            # cross_corr = np.zeros(len(detrended_1) * 2 -1) # Or handle differently
-            # For simplicity, we'll just plot the raw correlation if normalization is problematic
-            cross_corr = correlate(detrended_1, detrended_2, mode='full')
-            norm_factor = 1.0 # No normalization
-        else:
-            cross_corr = correlate(detrended_1, detrended_2, mode='full')
-            # Normalize cross-correlation
-            norm_factor = std_1 * std_2 * len(detrended_1)
-            cross_corr = cross_corr / norm_factor
-
-
-        lags = np.arange(-len(detrended_1) + 1, len(detrended_1))
-
-        plt.figure(figsize=FIGURE_SIZE_SINGLE)
-        plt.plot(lags, cross_corr, label=f'Cross-correlation: {source_names[0]} vs {source_names[1]}', color='darkorange')
-        plt.title(f'{filename_prefix} - Cross-correlation Analysis', fontsize=FONT_SIZE_TITLE)
-        plt.xlabel('Lag (Time Steps)', fontsize=FONT_SIZE_LABEL)
-        plt.ylabel('Normalized Cross-correlation' if norm_factor != 1.0 else 'Cross-correlation', fontsize=FONT_SIZE_LABEL)
-        plt.axvline(0, color='black', linestyle='--', alpha=0.5) # Zero lag line
-        plt.legend(fontsize=FONT_SIZE_LEGEND)
-        plt.grid(True, which='both', linestyle='--', alpha=0.7)
-        plt.savefig(f"{filename_prefix}_cross_correlation_{source_names[0].lower()}_{source_names[1].lower()}.png")
-        print(f"Saved cross-correlation plot to {filename_prefix}_cross_correlation_{source_names[0].lower()}_{source_names[1].lower()}.png")
-        plt.close()
-
-        max_corr_idx = np.argmax(np.abs(cross_corr))
-        print(f"Max absolute cross-correlation is {cross_corr[max_corr_idx]:.4f} at lag {lags[max_corr_idx]}.")
-
+def main():
+    parser = argparse.ArgumentParser(description="Analyze RUFT simulation data for Gravitational Waves.")
+    parser.add_argument("filepath", type=str, help="Path to the HDF5 simulation output file.")
+    args = parser.parse_args()
+    run_id = os.path.basename(args.filepath).replace("output_", "").replace(".h5", "")
+    U_series, x, y, times, params = load_sim_data(args.filepath)
+    if U_series is not None and len(U_series) > 0:
+        q_ij = calculate_quadrupole_moment(U_series, x, y, params)
+        h_plus, h_cross = calculate_gw_strain(q_ij, times)
+        if h_plus is not None:
+            plot_gw_results(times, h_plus, h_cross, run_id)
+            print("\n--- GW Analysis Complete ---")
     else:
-        print("Second data source not provided; skipping cross-correlation.")
-
-
-def main_gw_analysis():
-    print("--- Starting GW-like Feature Analysis ---")
-
-    # Example: Use total active cells from 3D simulation as a proxy for "system energy"
-    # This is a placeholder; actual GW analysis would need specific data types
-    # from simulations designed to model such phenomena.
-    active_3d_hist = load_gw_data(DATA_DIR, ACTIVE_HISTORY_FILE_3D)
-    # entropy_3d_hist = load_gw_data(DATA_DIR, "3D_entropy_history.npy") # If available and relevant
-
-    if active_3d_hist is None:
-        print("Primary data (3D active history) for GW analysis not available. Limited analysis possible.")
-    else:
-        # Plot the primary timeseries
-        plt.figure(figsize=FIGURE_SIZE_SINGLE)
-        plt.plot(active_3d_hist, label='Total Active Cells (3D Sim)', color='teal')
-        plt.title('GW Analysis - Input: Total Active Cells from 3D Simulation', fontsize=FONT_SIZE_TITLE)
-        plt.xlabel('Time Step', fontsize=FONT_SIZE_LABEL)
-        plt.ylabel('Number of Active Cells', fontsize=FONT_SIZE_LABEL)
-        plt.legend(fontsize=FONT_SIZE_LEGEND)
-        plt.savefig("GW_input_timeseries_3D_active.png")
-        plt.close()
-
-        # Analyze Power Spectral Density
-        plot_power_spectral_density(active_3d_hist, "Total Active Cells (3D)", filename_prefix="GW")
-
-        # Placeholder for more advanced GW-like pattern analysis
-        # This could involve looking for propagating waves if spatial data is loaded,
-        # or analyzing event timings.
-        # For now, let's use the active_3d_hist for autocorrelation as an example.
-        # If another relevant timeseries was available, e.g., "3D_total_resource.npy",
-        # it could be used for cross-correlation.
-        resource_3d_hist = load_gw_data(DATA_DIR, "3D_resource_history.npy") # Example second source
-
-        source_names_for_pattern = ["3D Active Cells"]
-        data_sources_for_pattern = [active_3d_hist]
-        if resource_3d_hist is not None:
-            source_names_for_pattern.append("3D Total Resource")
-            # Ensure same length for cross-correlation if used
-            min_len = min(len(active_3d_hist), len(resource_3d_hist))
-            data_sources_for_pattern = [active_3d_hist[:min_len], resource_3d_hist[:min_len]]
-            analyze_gw_patterns(data_sources_for_pattern[0], data_sources_for_pattern[1], source_names_for_pattern, filename_prefix="GW_Pattern_ActiveResource")
-        else:
-            analyze_gw_patterns(data_sources_for_pattern[0], source_names=source_names_for_pattern, filename_prefix="GW_Pattern_ActiveOnly")
-
-
-    print("\n--- GW-like Feature Analysis Complete ---")
+        print("Could not proceed with analysis due to data loading issues.")
 
 if __name__ == "__main__":
-    current_script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_directory = os.path.join(current_script_dir, DATA_DIR)
-
-    if not os.path.isdir(data_directory):
-        print(f"Error: Data directory '{data_directory}' not found.")
-    else:
-        main_gw_analysis()
-        print("\nTo view plots, check the current directory for .png files.")
-        print("Example: Open 'GW_psd_total_active_cells_3d.png'")
+    main()
