@@ -10,7 +10,7 @@ Simply click the links below to open them directly in Google Colab, a free, brow
 
 ### The Explorer's Path (Start Here)
 
-*   [**Introduction to RUFT (The Grand Tour)**](https://colab.research.google.com/drive/1l9NsiWO-inhVMr1eyWgl08taCHg2bdG3?usp=sharing)
+*   [**Introduction to RUFT (The Grand Tour)**](https://colab.research.google.com/drive/15UzoeLwGk6Jok-0BTh-eiMkrX3XibmB_?usp=sharing)
     *   This is the main hub. It provides an overview of the entire project and links to the other tutorials. **This is the best place to start.**
 
 ---
