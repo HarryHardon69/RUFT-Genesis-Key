@@ -1,245 +1,156 @@
-# RUFT-Genesis-Key/analysis/analysis_1d.py
-
 import numpy as np
+import h5py
 import matplotlib.pyplot as plt
-from scipy.signal import find_peaks, correlate
-from scipy.stats import linregress, entropy as scipy_entropy
+from matplotlib.animation import FuncAnimation
 import os
 
 # --- Configuration ---
-DATA_DIR = "../simulations"  # Relative path to where simulation data is stored
-ACTIVE_HISTORY_FILE_1D = "1D_active_history.npy"
-ENTROPY_HISTORY_FILE_1D = "1D_entropy_history.npy"
+# This script is designed to be run from the root of the "RUFT v4.0" project directory.
+# It will automatically find the output file from the 1D solver.
+SIM_DATA_PATH = os.path.join("SIMULATIONS", "1D_Solver", "output_1d.h5")
 
-# Plotting preferences
-plt.style.use('seaborn-v0_8-whitegrid')
-FIGURE_SIZE_SINGLE = (10, 6)
-FIGURE_SIZE_MULTI = (12, 10)
-FONT_SIZE_TITLE = 16
-FONT_SIZE_LABEL = 12
-FONT_SIZE_LEGEND = 10
-
-# Analysis parameters
-PEAK_PROMINENCE = 5  # For peak detection in active sites
-CORR_LAG_MAX = 100   # Max lag for autocorrelation
-
-def load_simulation_data(data_dir, active_file, entropy_file):
-    """Loads 1D simulation data."""
-    active_path = os.path.join(data_dir, active_file)
-    entropy_path = os.path.join(data_dir, entropy_file)
-
-    if not os.path.exists(active_path):
-        print(f"Error: Active history file not found: {active_path}")
-        return None, None
-    if not os.path.exists(entropy_path):
-        print(f"Error: Entropy history file not found: {entropy_path}")
-        return None, None
-
+# --- Data Loading Function ---
+def load_data(filepath):
+    """Loads and returns data from the specified HDF5 file."""
+    print(f"--- Loading data from {filepath} ---")
     try:
-        active_history = np.load(active_path)
-        entropy_history = np.load(entropy_path)
-        print(f"Successfully loaded data: {active_file}, {entropy_file}")
-        return active_history, entropy_history
+        with h5py.File(filepath, 'r') as f:
+            # Load mesh data
+            x_grid = f['/MESH_DATA/x_grid'][:]
+
+            # Load parameters for context
+            params = dict(f['/SIMULATION_PARAMETERS'].attrs)
+
+            # Load timesteps
+            timesteps = sorted(f['/TIMESTEPS'].keys(), key=int)
+            print(f"Found {len(timesteps)} saved timesteps.")
+
+            # Pre-allocate arrays for performance
+            num_steps = len(timesteps)
+            Nx = len(x_grid)
+            U_data = np.zeros((num_steps, Nx))
+            rho_data = np.zeros((num_steps, Nx))
+            sim_times = np.zeros(num_steps)
+
+            for i, ts_key in enumerate(timesteps):
+                U_data[i, :] = f[f'/TIMESTEPS/{ts_key}/fields/U'][:]
+                rho_data[i, :] = f[f'/TIMESTEPS/{ts_key}/fields/rho'][:]
+                sim_times[i] = f[f'/TIMESTEPS/{ts_key}/stats'].attrs['sim_time_s']
+
+            return {
+                "x_grid": x_grid,
+                "U_data": U_data,
+                "rho_data": rho_data,
+                "sim_times": sim_times,
+                "params": params
+            }
+    except FileNotFoundError:
+        print(f"FATAL ERROR: The data file was not found at '{filepath}'.")
+        print("Please ensure you have run the 'RUFT_1D_final.py' simulation first.")
+        return None
     except Exception as e:
-        print(f"Error loading data: {e}")
-        return None, None
-
-def plot_basic_timeseries(active_history, entropy_history, filename_prefix="1D"):
-    """Plots active sites and entropy over time."""
-    if active_history is None or entropy_history is None:
-        return
-
-    fig, ax = plt.subplots(2, 1, figsize=FIGURE_SIZE_MULTI, sharex=True)
-
-    # Active sites
-    ax[0].plot(active_history, label='Active Sites', color='royalblue')
-    ax[0].set_title(f'{filename_prefix} - Active Sites Over Time', fontsize=FONT_SIZE_TITLE)
-    ax[0].set_ylabel('Number of Active Sites', fontsize=FONT_SIZE_LABEL)
-    ax[0].legend(fontsize=FONT_SIZE_LEGEND)
-
-    # Entropy
-    ax[1].plot(entropy_history, label='Shannon Entropy', color='forestgreen')
-    ax[1].set_title(f'{filename_prefix} - Shannon Entropy Over Time', fontsize=FONT_SIZE_TITLE)
-    ax[1].set_xlabel('Time Step', fontsize=FONT_SIZE_LABEL)
-    ax[1].set_ylabel('Entropy (bits)', fontsize=FONT_SIZE_LABEL)
-    ax[1].legend(fontsize=FONT_SIZE_LEGEND)
-    ax[1].set_ylim(0, 1.05) # Max entropy for binary system is 1
-
-    plt.tight_layout()
-    plt.savefig(f"{filename_prefix}_basic_timeseries.png")
-    print(f"Saved basic timeseries plot to {filename_prefix}_basic_timeseries.png")
-    plt.close(fig)
-
-def analyze_periodicity(data, data_name, filename_prefix="1D"):
-    """Analyzes periodicity using autocorrelation."""
-    if data is None or len(data) < 2 * CORR_LAG_MAX:
-        print(f"Not enough data for {data_name} periodicity analysis.")
-        return
-
-    # Detrend data (simple mean subtraction)
-    detrended_data = data - np.mean(data)
-
-    autocorr = correlate(detrended_data, detrended_data, mode='full')
-    autocorr = autocorr[len(autocorr)//2:] # Keep only positive lags
-
-    # Normalize
-    if np.var(detrended_data) > 1e-6 : # Avoid division by zero for constant data
-        autocorr /= (np.var(detrended_data) * len(detrended_data))
-    else: # if data is constant, autocorrelation is flat
-        autocorr = np.ones_like(autocorr)
-
-
-    lags = np.arange(len(autocorr))
-
-    plt.figure(figsize=FIGURE_SIZE_SINGLE)
-    plt.plot(lags[:CORR_LAG_MAX], autocorr[:CORR_LAG_MAX], label=f'Autocorrelation of {data_name}', color='purple')
-    plt.title(f'{filename_prefix} - Autocorrelation Analysis for {data_name}', fontsize=FONT_SIZE_TITLE)
-    plt.xlabel('Lag (Time Steps)', fontsize=FONT_SIZE_LABEL)
-    plt.ylabel('Normalized Autocorrelation', fontsize=FONT_SIZE_LABEL)
-    plt.legend(fontsize=FONT_SIZE_LEGEND)
-    plt.grid(True, which='both', linestyle='--', alpha=0.7)
-    plt.savefig(f"{filename_prefix}_autocorrelation_{data_name.lower().replace(' ', '_')}.png")
-    print(f"Saved autocorrelation plot for {data_name} to {filename_prefix}_autocorrelation_{data_name.lower().replace(' ', '_')}.png")
-    plt.close()
-
-    # Find peaks in autocorrelation (potential periods)
-    peaks, _ = find_peaks(autocorr[:CORR_LAG_MAX], prominence=0.1, distance=5)
-    if len(peaks) > 0:
-        print(f"Potential periods for {data_name} (from autocorrelation peaks): {peaks}")
-    else:
-        print(f"No significant periodic behavior detected for {data_name} via autocorrelation.")
-
-
-def analyze_trends(active_history, entropy_history, filename_prefix="1D"):
-    """Analyzes trends using linear regression."""
-    if active_history is None or entropy_history is None:
-        return
-
-    time_steps = np.arange(len(active_history))
-
-    # Trend for active sites
-    slope_active, intercept_active, r_value_active, p_value_active, _ = linregress(time_steps, active_history)
-    print(f"\nTrend analysis for Active Sites ({filename_prefix}):")
-    print(f"  Slope: {slope_active:.4f}")
-    print(f"  R-squared: {r_value_active**2:.4f}")
-    print(f"  P-value: {p_value_active:.4f}")
-
-    # Trend for entropy
-    slope_entropy, intercept_entropy, r_value_entropy, p_value_entropy, _ = linregress(time_steps, entropy_history)
-    print(f"\nTrend analysis for Entropy ({filename_prefix}):")
-    print(f"  Slope: {slope_entropy:.4f}")
-    print(f"  R-squared: {r_value_entropy**2:.4f}")
-    print(f"  P-value: {p_value_entropy:.4f}")
-
-    # Plot trends
-    fig, ax = plt.subplots(2, 1, figsize=FIGURE_SIZE_MULTI, sharex=True)
-    ax[0].plot(time_steps, active_history, label='Active Sites', color='lightblue')
-    ax[0].plot(time_steps, intercept_active + slope_active * time_steps, color='darkblue', linestyle='--', label=f'Trend (R²={r_value_active**2:.2f})')
-    ax[0].set_title(f'{filename_prefix} - Trend in Active Sites', fontsize=FONT_SIZE_TITLE)
-    ax[0].set_ylabel('Number of Active Sites', fontsize=FONT_SIZE_LABEL)
-    ax[0].legend(fontsize=FONT_SIZE_LEGEND)
-
-    ax[1].plot(time_steps, entropy_history, label='Shannon Entropy', color='lightgreen')
-    ax[1].plot(time_steps, intercept_entropy + slope_entropy * time_steps, color='darkgreen', linestyle='--', label=f'Trend (R²={r_value_entropy**2:.2f})')
-    ax[1].set_title(f'{filename_prefix} - Trend in Shannon Entropy', fontsize=FONT_SIZE_TITLE)
-    ax[1].set_xlabel('Time Step', fontsize=FONT_SIZE_LABEL)
-    ax[1].set_ylabel('Entropy (bits)', fontsize=FONT_SIZE_LABEL)
-    ax[1].legend(fontsize=FONT_SIZE_LEGEND)
-
-    plt.tight_layout()
-    plt.savefig(f"{filename_prefix}_trends_analysis.png")
-    print(f"Saved trends analysis plot to {filename_prefix}_trends_analysis.png")
-    plt.close(fig)
-
-
-def calculate_stability(data, window_size=50, data_name="data"):
-    """Calculates stability as the inverse of rolling standard deviation."""
-    if data is None or len(data) < window_size:
-        print(f"Not enough data for {data_name} stability analysis.")
+        print(f"An unexpected error occurred while loading the data: {e}")
+        import traceback
+        traceback.print_exc()
         return None
 
-    rolling_std = np.convolve(data, np.ones(window_size)/window_size, mode='valid') # Moving average
-    rolling_std = np.array([np.std(data[i:i+window_size]) for i in range(len(data) - window_size + 1)])
+# --- Plotting Functions ---
 
-    # Stability: inverse of std. Add small epsilon to avoid division by zero.
-    stability = 1.0 / (rolling_std + 1e-9)
+def plot_snapshots(data):
+    """Creates a static plot of the fields at the start, middle, and end of the simulation."""
+    x = data["x_grid"]
+    U = data["U_data"]
+    rho = data["rho_data"]
+    times = data["sim_times"]
 
-    print(f"\nStability analysis for {data_name}:")
-    print(f"  Mean rolling standard deviation: {np.mean(rolling_std):.4f}")
-    print(f"  Mean stability: {np.mean(stability):.4f}")
-    return stability
+    num_steps = U.shape[0]
+    indices_to_plot = [0, num_steps // 2, num_steps - 1]
 
+    fig, axes = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    fig.suptitle("RUFT 1D Simulation Snapshots", fontsize=16)
 
-def plot_phase_space(active_history, entropy_history, filename_prefix="1D"):
-    """Plots a phase space diagram of entropy vs. active sites."""
-    if active_history is None or entropy_history is None:
-        return
+    # Plot U (Energy Density)
+    axes[0].set_title("Energy Density (U)")
+    for i in indices_to_plot:
+        axes[0].plot(x, U[i, :], label=f'Time = {times[i]:.3f} s')
+    axes[0].set_ylabel("U (Unitless)")
+    axes[0].grid(True, linestyle='--', alpha=0.6)
+    axes[0].legend()
 
-    plt.figure(figsize=FIGURE_SIZE_SINGLE)
-    # Use a colormap to show time evolution
-    time_points = np.arange(len(active_history))
-    scatter = plt.scatter(active_history, entropy_history, c=time_points, cmap='viridis', alpha=0.7, s=10)
+    # Plot rho (Mass Density)
+    axes[1].set_title("Mass Density (rho)")
+    for i in indices_to_plot:
+        axes[1].plot(x, rho[i, :], label=f'Time = {times[i]:.3f} s')
+    axes[1].set_xlabel("Position (m)")
+    axes[1].set_ylabel("rho (Unitless)")
+    axes[1].grid(True, linestyle='--', alpha=0.6)
+    axes[1].legend()
 
-    plt.title(f'{filename_prefix} - Phase Space: Entropy vs. Active Sites', fontsize=FONT_SIZE_TITLE)
-    plt.xlabel('Number of Active Sites', fontsize=FONT_SIZE_LABEL)
-    plt.ylabel('Shannon Entropy (bits)', fontsize=FONT_SIZE_LABEL)
-    cbar = plt.colorbar(scatter, label='Time Step')
-    cbar.ax.tick_params(labelsize=FONT_SIZE_LABEL-2)
-    cbar.set_label('Time Step', size=FONT_SIZE_LABEL)
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
 
-    plt.grid(True, linestyle='--', alpha=0.7)
-    plt.savefig(f"{filename_prefix}_phase_space.png")
-    print(f"Saved phase space plot to {filename_prefix}_phase_space.png")
-    plt.close()
+    # Save the figure
+    output_dir = "VISUALIZATION/notebooks/"
+    os.makedirs(output_dir, exist_ok=True)
+    snapshot_filename = os.path.join(output_dir, "1d_snapshots.png")
+    plt.savefig(snapshot_filename)
+    print(f"Snapshot plot saved to '{snapshot_filename}'")
 
-def main_1d_analysis():
-    print("--- Starting 1D Simulation Analysis ---")
+    plt.show()
 
-    active_hist, entropy_hist = load_simulation_data(DATA_DIR, ACTIVE_HISTORY_FILE_1D, ENTROPY_HISTORY_FILE_1D)
+def create_animation(data):
+    """Creates and saves an animation of the Energy Density (U) field."""
+    x = data["x_grid"]
+    U = data["U_data"]
+    times = data["sim_times"]
 
-    if active_hist is None or entropy_hist is None:
-        print("Exiting due to data loading issues.")
-        return
+    fig, ax = plt.subplots(figsize=(10, 6))
+    ax.set_title("RUFT 1D: Energy Density (U) Evolution")
+    ax.set_xlabel("Position (m)")
+    ax.set_ylabel("U (Unitless)")
+    ax.grid(True, linestyle='--', alpha=0.6)
 
-    # Basic plots
-    plot_basic_timeseries(active_hist, entropy_hist, filename_prefix="1D")
+    # Set fixed y-limits for a stable animation view
+    y_min = np.min(U) * 1.1
+    y_max = np.max(U) * 1.1
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlim(np.min(x), np.max(x))
 
-    # Periodicity analysis
-    analyze_periodicity(active_hist, "Active Sites", filename_prefix="1D")
-    analyze_periodicity(entropy_hist, "Entropy", filename_prefix="1D")
+    line, = ax.plot(x, U[0, :], lw=2)
+    time_text = ax.text(0.05, 0.9, '', transform=ax.transAxes)
 
-    # Trend analysis
-    analyze_trends(active_hist, entropy_hist, filename_prefix="1D")
+    def animate(i):
+        line.set_ydata(U[i, :])
+        time_text.set_text(f'Time = {times[i]:.3f} s')
+        return line, time_text
 
-    # Stability analysis (using active sites as an example)
-    stability_active = calculate_stability(active_hist, data_name="Active Sites")
-    if stability_active is not None:
-        plt.figure(figsize=FIGURE_SIZE_SINGLE)
-        plt.plot(np.arange(len(stability_active)), stability_active, label='Stability of Active Sites', color='teal')
-        plt.title('1D - Stability of Active Sites Over Time', fontsize=FONT_SIZE_TITLE)
-        plt.xlabel(f'Time Step (windowed, size={50})', fontsize=FONT_SIZE_LABEL)
-        plt.ylabel('Stability (1 / Rolling Std Dev)', fontsize=FONT_SIZE_LABEL)
-        plt.legend(fontsize=FONT_SIZE_LEGEND)
-        plt.savefig("1D_stability_active_sites.png")
-        print("Saved stability plot for active sites to 1D_stability_active_sites.png")
-        plt.close()
+    # Create the animation
+    # Note: We use a subset of frames for a smoother video if there are many saved steps.
+    frame_step = max(1, len(times) // 200) # Aim for ~200 frames in the video
+    anim = FuncAnimation(fig, animate, frames=range(0, len(times), frame_step),
+                          blit=True, interval=50)
 
-    # Phase space plot
-    plot_phase_space(active_hist, entropy_hist, filename_prefix="1D")
+    # Save the animation
+    output_dir = "VISUALIZATION/notebooks/"
+    os.makedirs(output_dir, exist_ok=True)
+    animation_filename = os.path.join(output_dir, "1d_U_field_animation.mp4")
+    try:
+        anim.save(animation_filename, writer='ffmpeg', fps=15)
+        print(f"Animation saved to '{animation_filename}'")
+    except Exception as e:
+        print("\n--- Animation Saving Failed ---")
+        print("Could not save animation. This usually means 'ffmpeg' is not installed.")
+        print("To install on Debian/Ubuntu: sudo apt-get install ffmpeg")
+        print("To install on other systems, see ffmpeg documentation.")
+        print(f"System Error: {e}")
 
-    print("\n--- 1D Simulation Analysis Complete ---")
+    plt.show()
 
-
+# --- Main Execution Block ---
 if __name__ == "__main__":
-    # Ensure the ../simulations directory exists relative to this script
-    # This is a common structure, but might need adjustment based on execution context
-    current_script_dir = os.path.dirname(os.path.abspath(__file__))
-    data_directory = os.path.join(current_script_dir, DATA_DIR)
+    simulation_data = load_data(SIM_DATA_PATH)
 
-    if not os.path.isdir(data_directory):
-        print(f"Error: Data directory '{data_directory}' not found. Please ensure the simulation data is present.")
-        print("You might need to run the simulations first, or adjust DATA_DIR if they are elsewhere.")
-    else:
-        main_1d_analysis()
-        print("\nTo view plots, check the current directory for .png files.")
-        print("Example: Open '1D_basic_timeseries.png'")
+    if simulation_data:
+        print("\n--- Generating Plots ---")
+        plot_snapshots(simulation_data)
+        create_animation(simulation_data)
+        print("\n--- Analysis Complete ---")
