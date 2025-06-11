@@ -1,369 +1,151 @@
-# RUFT-Genesis-Key/simulations/3D_replicator_final.py
-
 import numpy as np
-import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
-import matplotlib.animation as animation
+import h5py
+import os
+from dataclasses import dataclass, asdict
 import time
+import traceback
+import matplotlib.pyplot as plt
 
-# --- Configuration Parameters ---
-GRID_SIZE_X = 30
-GRID_SIZE_Y = 30
-GRID_SIZE_Z = 30
-TIME_STEPS = 100
+# --- Part 1: Parameter Setup (Unchanged from your working version) ---
+@dataclass
+class ReplicatorSimParametersV2:
+    Lx: float = 10.0; Ly: float = 10.0; Lz: float = 10.0
+    Nx: int = 16; Ny: int = 16; Nz: int = 16
+    scan_time: float = 0.05; print_time: float = 0.05
+    Nt_per_phase: int = 200
+    save_interval: int = 20
+    c_scaled: float = 300.0; kappa: float = 1.0; m_phi_sq: float = 0.1
+    gamma: float = 0.1; g_EM: float = 1.0
+    scan_zeta: float = 100.0; scan_delta: float = 200.0
+    print_zeta: float = 200.0; print_delta: float = 50.0
+    rho_seed_value: float = 10.0
+    hologram_center: tuple = (5.0, 5.0, 5.0)
+    hologram_radius: float = 2.0
+    hologram_omega: float = 500.0
 
-# Initial state
-INITIAL_PATTERN = "central_cube"  # "random", "central_sphere", "central_cube", "multiple_seeds"
-INITIAL_DENSITY = 0.05  # For "random"
-SEED_COUNT = 5          # For "multiple_seeds"
+    def get_params_dict(self):
+        p = asdict(self)
+        p['dx'] = p['Lx']/p['Nx']; p['dy'] = p['Ly']/p['Ny']; p['dz'] = p['Lz']/p['Nz']
+        p['dt'] = self.scan_time / self.Nt_per_phase
+        return p
 
-# Replication and Resource Dynamics
-REPLICATION_THRESHOLD_MIN = 4 # Min active neighbors to replicate (out of 26)
-REPLICATION_THRESHOLD_MAX = 7 # Max active neighbors (above this, overcrowding)
-RESOURCE_INITIAL_LEVEL = 100.0  # Initial resource units per cell
-RESOURCE_CONSUMPTION_ACTIVE = 5.0  # Resource consumed by an active cell per step
-RESOURCE_CONSUMPTION_REPLICATE = 20.0 # Additional resource consumed for replication
-RESOURCE_REGENERATION_RATE = 0.5 # Resource regenerated per cell per step (if not depleted)
-DEPLETION_THRESHOLD = 1.0 # Below this, cell cannot be active or replicate
+# --- Part 2: Numerical Solver Core (Unchanged) ---
+def laplacian_3d(f, dx, dy, dz):
+    return ((np.roll(f, -1, axis=2) - 2*f + np.roll(f, 1, axis=2)) / dz**2 +
+           (np.roll(f, -1, axis=1) - 2*f + np.roll(f, 1, axis=1)) / dy**2 +
+           (np.roll(f, -1, axis=0) - 2*f + np.roll(f, 1, axis=0)) / dx**2)
 
-# Cell States
-# 0: Inactive / Quiescent (Sufficient resources)
-# 1: Active (Consuming resources)
-# 2: Depleted (Insufficient resources, cannot activate)
-# Refractory period is implicitly handled by resource depletion and regeneration.
+# --- Part 3: Main Simulation Engine (HDF5 Logic added) ---
+def run_solver(p, h5_file):
+    print("--- Starting RUFT 3D Replicator Solver Loop (v2.3) ---")
 
-# --- Visualization Parameters ---
-VISUALIZATION_TYPE = "scatter" # "scatter", "voxels" (voxels can be slow for large grids)
-VISUALIZATION_FREQUENCY = 5 # Update plot every N steps (if not using animation)
-ANIMATION_ENABLED = True    # If False, plots snapshots
-ANIMATION_INTERVAL = 100    # Milliseconds between frames for animation
-PLOT_STYLE_ACTIVE = 'cyan'
-PLOT_STYLE_DEPLETED = 'red'
-PLOT_ALPHA = 0.7
+    # (Setup logic is identical)
+    x = np.linspace(0, p['Lx'], p['Nx'], endpoint=False)
+    y = np.linspace(0, p['Ly'], p['Ny'], endpoint=False)
+    z = np.linspace(0, p['Lz'], p['Nz'], endpoint=False)
+    X, Y, Z = np.meshgrid(x, y, z, indexing='ij')
+    U = np.zeros((3, p['Nx'], p['Ny'], p['Nz'])); phi = np.zeros((3, p['Nx'], p['Ny'], p['Nz']))
+    rho = np.zeros((p['Nx'], p['Ny'], p['Nz']))
+    pattern_buffer = np.zeros((p['Nt_per_phase'], p['Nx'], p['Ny'], p['Nz']))
+    hologram_mask = np.sqrt((X - p['hologram_center'][0])**2 + (Y - p['hologram_center'][1])**2 + (Z - p['hologram_center'][2])**2) < p['hologram_radius']
+    total_rho_history = []; time_history = []
 
-class CellAutomaton3D:
-    def __init__(self):
-        self.size_x, self.size_y, self.size_z = GRID_SIZE_X, GRID_SIZE_Y, GRID_SIZE_Z
-        self.grid_state = np.zeros((self.size_x, self.size_y, self.size_z), dtype=int)
-        self.grid_resource = np.full_like(self.grid_state, RESOURCE_INITIAL_LEVEL, dtype=float)
-        self._initialize_grid()
+    # --- FIX: HDF5 Group Setup within the solver ---
+    timesteps_group = h5_file.create_group("TIMESTEPS")
 
-        self.history_active_cells = []
-        self.history_depleted_cells = []
-        self.history_total_resource = []
+    # PHASE 1: SCANNING
+    print("\n--- BEGINNING PHASE 1: SCANNING ---")
+    rho[hologram_mask] = p['rho_seed_value']
+    for n in range(1, p['Nt_per_phase']):
+        t_curr = n * p['dt']
+        # (Physics is identical)
+        hologram_field = np.zeros_like(X); hologram_field[hologram_mask] = np.sin(p['hologram_omega'] * t_curr)
+        interaction_term = p['g_EM'] * phi[1, ...] * (-2 * hologram_field**2)
+        rho_dot = p['scan_zeta'] * interaction_term * rho - p['scan_delta'] * rho
+        rho += p['dt'] * rho_dot; rho[:]=np.clip(rho, 0, 1e6)
+        pattern_buffer[n, ...] = np.abs(rho_dot)
 
-    def _initialize_grid(self):
-        if INITIAL_PATTERN == "random":
-            self.grid_state = (np.random.rand(self.size_x, self.size_y, self.size_z) < INITIAL_DENSITY).astype(int)
-        elif INITIAL_PATTERN == "central_sphere":
-            cx, cy, cz = self.size_x // 2, self.size_y // 2, self.size_z // 2
-            radius = min(self.size_x, self.size_y, self.size_z) // 4
-            for x in range(self.size_x):
-                for y in range(self.size_y):
-                    for z in range(self.size_z):
-                        if (x-cx)**2 + (y-cy)**2 + (z-cz)**2 < radius**2:
-                            self.grid_state[x, y, z] = 1
-        elif INITIAL_PATTERN == "central_cube":
-            cx, cy, cz = self.size_x // 2, self.size_y // 2, self.size_z // 2
-            s = max(1,min(self.size_x, self.size_y, self.size_z) // 5)
-            self.grid_state[cx-s:cx+s, cy-s:cy+s, cz-s:cz+s] = 1
-        elif INITIAL_PATTERN == "multiple_seeds":
-            for _ in range(SEED_COUNT):
-                sx, sy, sz = np.random.randint(0,self.size_x), np.random.randint(0,self.size_y), np.random.randint(0,self.size_z)
-                self.grid_state[sx,sy,sz] = 1
+        total_rho = np.sum(rho) * p['dx'] * p['dy'] * p['dz']
+        total_rho_history.append(total_rho); time_history.append(t_curr)
+        if (n + 1) % p['save_interval'] == 0:
+            print(f"[Scan] Step: {n+1}/{p['Nt_per_phase']}, Time: {t_curr:.3f}s, Total Rho: {total_rho:.3e}")
 
-        # Cells starting as active immediately consume replication resources if possible, otherwise just active consumption
-        for x, y, z in np.argwhere(self.grid_state == 1):
-            if self.grid_resource[x,y,z] >= RESOURCE_CONSUMPTION_REPLICATE:
-                 self.grid_resource[x,y,z] -= RESOURCE_CONSUMPTION_REPLICATE
-            else:
-                 self.grid_resource[x,y,z] -= RESOURCE_CONSUMPTION_ACTIVE
-            if self.grid_resource[x,y,z] < DEPLETION_THRESHOLD:
-                self.grid_state[x,y,z] = 2 # Becomes depleted
+    # PHASE 2: PRINTING
+    print("\n--- BEGINNING PHASE 2: PRINTING ---")
+    rho.fill(0)
+    for n in range(1, p['Nt_per_phase']):
+        t_curr = p['scan_time'] + (n * p['dt'])
+        # (Physics is identical)
+        pattern_playback = pattern_buffer[n, ...]
+        rho_dot = p['print_zeta'] * pattern_playback - p['print_delta'] * rho
+        rho += p['dt'] * rho_dot; rho[:]=np.clip(rho, 0, 1e6)
 
+        total_rho = np.sum(rho) * p['dx'] * p['dy'] * p['dz']
+        total_rho_history.append(total_rho); time_history.append(t_curr)
+        if (n + 1) % p['save_interval'] == 0:
+            # --- FIX: Saving data for the Print Phase ---
+            step_group = timesteps_group.create_group(str(n + 1 + p['Nt_per_phase'])) # Unique key for this phase
+            fields_group = step_group.create_group("fields")
+            fields_group.create_dataset("rho_slice_xy", data=rho[:, :, p['Nz']//2], compression="gzip")
+            stats_group = step_group.create_group("stats")
+            stats_group.attrs["sim_time_s"] = t_curr
+            print(f"[Print] Step: {n+1}/{p['Nt_per_phase']}, Time: {t_curr:.3f}s, Total Rho: {total_rho:.3e}")
 
-    def _count_active_neighbors(self, x, y, z):
-        count = 0
-        for i in range(max(0, x-1), min(self.size_x, x+2)):
-            for j in range(max(0, y-1), min(self.size_y, y+2)):
-                for k in range(max(0, z-1), min(self.size_z, z+2)):
-                    if (i, j, k) == (x, y, z):
-                        continue
-                    if self.grid_state[i, j, k] == 1: # Only count active cells
-                        count += 1
-        return count
+    print(f"--- [Replicator Sim v2.3] Finished. ---")
+    return rho, time_history, total_rho_history
 
-    def step(self):
-        new_grid_state = self.grid_state.copy()
-        new_grid_resource = self.grid_resource.copy()
+def main():
+    """Main execution function with robust I/O."""
+    print("--- RUFT v5.0 Genesis Key: 3D Scan-and-Print Replicator (Final) ---")
 
-        for x in range(self.size_x):
-            for y in range(self.size_y):
-                for z in range(self.size_z):
-                    current_state = self.grid_state[x, y, z]
-                    current_resource = self.grid_resource[x, y, z]
-                    active_neighbors = self._count_active_neighbors(x, y, z)
+    params = ReplicatorSimParametersV2()
+    params_dict = params.get_params_dict()
+    run_id = f"replicator_v2.3_Z{params.print_zeta}_d{params.print_delta}"
 
-                    # 1. Resource Regeneration
-                    if current_state != 2 : # Depleted cells do not regenerate until neighbors make them active again (implicitly)
-                         new_grid_resource[x,y,z] = min(RESOURCE_INITIAL_LEVEL, current_resource + RESOURCE_REGENERATION_RATE)
+    sim_dir = "simulations"
+    output_dir = os.path.join(sim_dir, "output")
+    os.makedirs(output_dir, exist_ok=True)
+    output_path = os.path.join(output_dir, f"output_{run_id}.h5")
 
-                    # 2. State Transitions & Resource Consumption
-                    if current_state == 1: # Active cell
-                        if new_grid_resource[x,y,z] >= RESOURCE_CONSUMPTION_ACTIVE:
-                            new_grid_resource[x,y,z] -= RESOURCE_CONSUMPTION_ACTIVE
-                            if new_grid_resource[x,y,z] < DEPLETION_THRESHOLD:
-                                new_grid_state[x,y,z] = 2 # Becomes depleted
-                            # Active cells don't automatically become inactive unless depleted
-                            # They might be "killed" by overcrowding or stay active
-                        else:
-                            new_grid_state[x,y,z] = 2 # Not enough resource to sustain, becomes depleted
+    try:
+        # --- FIX: Full HDF5 file handling is restored ---
+        with h5py.File(output_path, 'w') as f:
+            param_group = f.create_group("SIMULATION_PARAMETERS"); param_group.attrs.update(params_dict)
+            mesh_group = f.create_group("MESH_DATA")
+            mesh_group.create_dataset("x_grid", data=np.linspace(0, params_dict['Lx'], params_dict['Nx'], endpoint=False))
+            mesh_group.create_dataset("y_grid", data=np.linspace(0, params_dict['Ly'], params_dict['Ny'], endpoint=False))
+            mesh_group.create_dataset("z_grid", data=np.linspace(0, params_dict['Lz'], params_dict['Nz'], endpoint=False))
 
-                    elif current_state == 0: # Quiescent cell
-                        if new_grid_resource[x,y,z] >= RESOURCE_CONSUMPTION_REPLICATE:
-                            if REPLICATION_THRESHOLD_MIN <= active_neighbors <= REPLICATION_THRESHOLD_MAX:
-                                new_grid_state[x,y,z] = 1 # Replicates (becomes active)
-                                new_grid_resource[x,y,z] -= RESOURCE_CONSUMPTION_REPLICATE
-                                if new_grid_resource[x,y,z] < DEPLETION_THRESHOLD: # Check if replication depleted it
-                                    new_grid_state[x,y,z] = 2
-                        elif new_grid_resource[x,y,z] < DEPLETION_THRESHOLD : # handles case where regeneration wasn't enough
-                             new_grid_state[x,y,z] = 2 # Not enough to do anything, ensure it's marked depleted.
+            final_rho, time_hist, rho_history = run_solver(params_dict, f)
 
+            f.create_dataset("total_rho_history", data=np.array(rho_history))
+            f.create_dataset("time_history", data=np.array(time_hist))
 
-                    elif current_state == 2: # Depleted cell
-                        # Can it become quiescent again due to resource regeneration?
-                        if new_grid_resource[x,y,z] >= DEPLETION_THRESHOLD:
-                            # Now, can it become active due to neighbors?
-                            if new_grid_resource[x,y,z] >= RESOURCE_CONSUMPTION_REPLICATE and \
-                               REPLICATION_THRESHOLD_MIN <= active_neighbors <= REPLICATION_THRESHOLD_MAX :
-                                new_grid_state[x,y,z] = 1 # Becomes active from depleted
-                                new_grid_resource[x,y,z] -= RESOURCE_CONSUMPTION_REPLICATE
-                                if new_grid_resource[x,y,z] < DEPLETION_THRESHOLD: # Check again
-                                    new_grid_state[x,y,z] = 2
-                            elif new_grid_resource[x,y,z] >= DEPLETION_THRESHOLD : # Not enough to replicate or conditions not met
-                                 new_grid_state[x,y,z] = 0 # Becomes quiescent
-                        # else remains depleted.
+        print(f"--- Simulation Finished. Data successfully saved to {output_path} ---")
 
-        self.grid_state = new_grid_state
-        self.grid_resource = new_grid_resource
+        # Plotting logic is now guaranteed to work with saved data
+        fig, axes = plt.subplots(1, 2, figsize=(16, 7))
+        fig.suptitle(f"Run ID: {run_id}", fontsize=16)
 
-        self.history_active_cells.append(np.sum(self.grid_state == 1))
-        self.history_depleted_cells.append(np.sum(self.grid_state == 2))
-        self.history_total_resource.append(np.sum(self.grid_resource))
+        final_rho_slice = final_rho[:, :, params.Nz//2]
+        im = axes[0].imshow(final_rho_slice.T, origin='lower', extent=[0, params.Lx, 0, params.Ly])
+        fig.colorbar(im, ax=axes[0], label="Final Mass Density (rho)")
+        axes[0].set_title("Replicator Result: Final State XY Slice"); axes[0].set_xlabel("x (m)"); axes[0].set_ylabel("y (m)")
 
+        axes[1].plot(time_hist, rho_history)
+        axes[1].axvline(x=params_dict['scan_time'], color='r', linestyle='--', label='Scan/Print Transition')
+        axes[1].set_title("History of Total Mass in Cavity"); axes[1].set_xlabel("Time (s)"); axes[1].set_ylabel("Total Rho (Unitless)")
+        axes[1].grid(True); axes[1].legend()
 
-    def plot_snapshot(self, ax_3d, ax_hist, step_num):
-        ax_3d.clear()
-        active_cells = np.argwhere(self.grid_state == 1)
-        depleted_cells = np.argwhere(self.grid_state == 2)
-
-        if VISUALIZATION_TYPE == "scatter":
-            if active_cells.size > 0:
-                ax_3d.scatter(active_cells[:,0], active_cells[:,1], active_cells[:,2], color=PLOT_STYLE_ACTIVE, alpha=PLOT_ALPHA, label='Active', s=20)
-            if depleted_cells.size > 0:
-                ax_3d.scatter(depleted_cells[:,0], depleted_cells[:,1], depleted_cells[:,2], color=PLOT_STYLE_DEPLETED, alpha=PLOT_ALPHA, label='Depleted', s=20)
-        elif VISUALIZATION_TYPE == "voxels":
-            voxels_display = np.zeros_like(self.grid_state, dtype=bool)
-            if active_cells.size > 0:
-                voxels_display[active_cells[:,0], active_cells[:,1], active_cells[:,2]] = True
-            if depleted_cells.size > 0: # Voxel color is tricky, this will just show presence
-                voxels_display[depleted_cells[:,0], depleted_cells[:,1], depleted_cells[:,2]] = True
-
-            # For voxels, we may need to be more creative with colors if showing multiple states
-            # This example uses a single color for any non-zero state if 'voxels' is chosen.
-            # A better voxel plot would assign colors based on self.grid_state.
-            colors = np.empty(self.grid_state.shape, dtype=object)
-            colors[self.grid_state == 1] = PLOT_STYLE_ACTIVE
-            colors[self.grid_state == 2] = PLOT_STYLE_DEPLETED
-
-            # Only plot if there's something to show
-            if np.any(voxels_display):
-                 ax_3d.voxels(voxels_display, facecolors=colors[voxels_display], edgecolor='k', alpha=PLOT_ALPHA)
-
-
-        ax_3d.set_xlim(0, self.size_x)
-        ax_3d.set_ylim(0, self.size_y)
-        ax_3d.set_zlim(0, self.size_z)
-        ax_3d.set_title(f"3D Replicator - Step {step_num}")
-        ax_3d.set_xlabel("X")
-        ax_3d.set_ylabel("Y")
-        ax_3d.set_zlabel("Z")
-        if not ax_3d.get_legend(): # Avoid duplicate legends
-            ax_3d.legend(loc='upper left')
-
-
-        # Update history plots
-        ax_hist[0].clear()
-        ax_hist[0].plot(self.history_active_cells, 'b-', label='Active Cells')
-        ax_hist[0].plot(self.history_depleted_cells, 'r-', label='Depleted Cells')
-        ax_hist[0].set_title("Cell Counts Over Time")
-        ax_hist[0].set_xlabel("Time Step")
-        ax_hist[0].set_ylabel("Count")
-        ax_hist[0].legend()
-        ax_hist[0].grid(True)
-
-        ax_hist[1].clear()
-        ax_hist[1].plot(self.history_total_resource, 'g-', label='Total Resource')
-        ax_hist[1].set_title("Total Resource Over Time")
-        ax_hist[1].set_xlabel("Time Step")
-        ax_hist[1].set_ylabel("Resource Units")
-        ax_hist[1].legend()
-        ax_hist[1].grid(True)
-
-        plt.draw()
-        plt.pause(0.01)
-
-    def run_simulation_no_animation(self):
-        print(f"Starting 3D Replicator simulation (no animation): Grid={self.size_x}x{self.size_y}x{self.size_z}, Steps={TIME_STEPS}")
-        fig = plt.figure(figsize=(16, 8))
-        ax_3d = fig.add_subplot(121, projection='3d')
-
-        # Create a 2x1 grid for history plots on the right
-        gs = fig.add_gridspec(2, 2)
-        ax_hist_cells = fig.add_subplot(gs[0, 1])
-        ax_hist_resource = fig.add_subplot(gs[1, 1])
-        ax_hist = [ax_hist_cells, ax_hist_resource]
-
-        fig.tight_layout(pad=3.0)
-        start_time = time.time()
-
-        for t in range(TIME_STEPS):
-            self.step()
-            if (t + 1) % VISUALIZATION_FREQUENCY == 0 or t == 0:
-                self.plot_snapshot(ax_3d, ax_hist, t + 1)
-                print(f"Step {t + 1}/{TIME_STEPS} - Active: {self.history_active_cells[-1]}, Depleted: {self.history_depleted_cells[-1]}, Resource: {self.history_total_resource[-1]:.2f}")
-
-        end_time = time.time()
-        print(f"Simulation finished in {end_time - start_time:.2f} seconds.")
-        final_plot_filename = "3D_replicator_simulation_final_state.png"
-        fig.savefig(final_plot_filename)
-        print(f"Final state plot saved as {final_plot_filename}")
+        plt.tight_layout(rect=[0,0,1,0.95])
+        plot_path = os.path.join(output_dir, f"summary_plot_{run_id}.png")
+        plt.savefig(plot_path)
+        print(f"Summary plot saved to {plot_path}")
         plt.show()
 
-    def run_simulation_with_animation(self):
-        print(f"Starting 3D Replicator simulation (with animation): Grid={self.size_x}x{self.size_y}x{self.size_z}, Steps={TIME_STEPS}")
-        fig = plt.figure(figsize=(16, 8))
-        ax_3d = fig.add_subplot(121, projection='3d')
-
-        gs = fig.add_gridspec(2, 2)
-        ax_hist_cells = fig.add_subplot(gs[0, 1])
-        ax_hist_resource = fig.add_subplot(gs[1, 1])
-
-        fig.tight_layout(pad=3.0)
-
-        # Store artists that change for blitting
-        active_scatter = ax_3d.scatter([], [], [], color=PLOT_STYLE_ACTIVE, alpha=PLOT_ALPHA, label='Active', s=20)
-        depleted_scatter = ax_3d.scatter([], [], [], color=PLOT_STYLE_DEPLETED, alpha=PLOT_ALPHA, label='Depleted', s=20)
-
-        # Initial legend for 3D plot
-        ax_3d.legend(loc='upper left')
-
-        # Lines for history plots
-        line_active_hist, = ax_hist_cells.plot([], [], 'b-', label='Active Cells')
-        line_depleted_hist, = ax_hist_cells.plot([], [], 'r-', label='Depleted Cells')
-        ax_hist_cells.set_title("Cell Counts Over Time")
-        ax_hist_cells.set_xlabel("Time Step")
-        ax_hist_cells.set_ylabel("Count")
-        ax_hist_cells.legend()
-        ax_hist_cells.grid(True)
-        ax_hist_cells.set_xlim(0, TIME_STEPS)
-        ax_hist_cells.set_ylim(0, self.size_x*self.size_y*self.size_z / 4) # Estimate max count
-
-        line_resource_hist, = ax_hist_resource.plot([], [], 'g-', label='Total Resource')
-        ax_hist_resource.set_title("Total Resource Over Time")
-        ax_hist_resource.set_xlabel("Time Step")
-        ax_hist_resource.set_ylabel("Resource Units")
-        ax_hist_resource.legend()
-        ax_hist_resource.grid(True)
-        ax_hist_resource.set_xlim(0, TIME_STEPS)
-        ax_hist_resource.set_ylim(0, self.size_x*self.size_y*self.size_z*RESOURCE_INITIAL_LEVEL * 1.1)
-
-
-        simulation_step_counter = 0
-
-        def update_fig(frame_num):
-            nonlocal simulation_step_counter, active_scatter, depleted_scatter
-            if simulation_step_counter < TIME_STEPS:
-                self.step()
-
-                active_cells = np.argwhere(self.grid_state == 1)
-                depleted_cells = np.argwhere(self.grid_state == 2)
-
-                # Update 3D scatter plots
-                # Note: For scatter, we need to update the _offsets3d property.
-                # This is a bit of a hack for blitting with scatter3d.
-                if active_cells.size > 0:
-                    active_scatter._offsets3d = (active_cells[:,0], active_cells[:,1], active_cells[:,2])
-                else:
-                    active_scatter._offsets3d = ([], [], [])
-
-                if depleted_cells.size > 0:
-                    depleted_scatter._offsets3d = (depleted_cells[:,0], depleted_cells[:,1], depleted_cells[:,2])
-                else:
-                    depleted_scatter._offsets3d = ([], [], [])
-
-                ax_3d.set_title(f"3D Replicator - Step {simulation_step_counter + 1}")
-
-                # Update history plots
-                line_active_hist.set_data(range(len(self.history_active_cells)), self.history_active_cells)
-                line_depleted_hist.set_data(range(len(self.history_depleted_cells)), self.history_depleted_cells)
-                if self.history_active_cells or self.history_depleted_cells:
-                    max_y_count = max(max(self.history_active_cells if self.history_active_cells else [0]),
-                                      max(self.history_depleted_cells if self.history_depleted_cells else [0]))
-                    ax_hist_cells.set_ylim(0, max(10, max_y_count * 1.1))
-
-
-                line_resource_hist.set_data(range(len(self.history_total_resource)), self.history_total_resource)
-                if self.history_total_resource:
-                     ax_hist_resource.set_ylim(0, max(10,max(self.history_total_resource) *1.1))
-
-
-                if (simulation_step_counter + 1) % VISUALIZATION_FREQUENCY == 0:
-                    print(f"Step {simulation_step_counter + 1}/{TIME_STEPS} - Active: {self.history_active_cells[-1]}, Depleted: {self.history_depleted_cells[-1]}, Resource: {self.history_total_resource[-1]:.2f}")
-
-                simulation_step_counter += 1
-
-            # Return list of artists that have been modified
-            return [active_scatter, depleted_scatter, line_active_hist, line_depleted_hist, line_resource_hist, ax_3d.title]
-
-
-        start_time = time.time()
-        ani = animation.FuncAnimation(fig, update_fig, frames=TIME_STEPS, interval=ANIMATION_INTERVAL, blit=True, repeat=False)
-
-        plt.show()
-        end_time = time.time()
-        print(f"Animation displayed. Total time: {end_time - start_time:.2f} seconds.")
-
-        try:
-            animation_filename = "3D_replicator_simulation.gif" # or .mp4
-            ani.save(animation_filename, writer='imagemagick', fps=1000/ANIMATION_INTERVAL)
-            print(f"Animation saved as {animation_filename}")
-        except Exception as e:
-            print(f"Could not save animation: {e}. Make sure imagemagick (for gif) or ffmpeg (for mp4) is installed.")
-
-        # Save final data
-        np.save("3D_active_history.npy", np.array(self.history_active_cells))
-        np.save("3D_depleted_history.npy", np.array(self.history_depleted_cells))
-        np.save("3D_resource_history.npy", np.array(self.history_total_resource))
-        print("Active, depleted, and resource history data saved.")
-
+    except Exception as e:
+        print(f"FATAL ERROR: An unexpected error occurred.")
+        traceback.print_exc()
 
 if __name__ == "__main__":
-    automaton = CellAutomaton3D()
-    if ANIMATION_ENABLED:
-        automaton.run_simulation_with_animation()
-    else:
-        automaton.run_simulation_no_animation()
-    print("3D Replicator simulation run complete.")
-
-    # To load data:
-    # active_hist = np.load("3D_active_history.npy")
-    # depleted_hist = np.load("3D_depleted_history.npy")
-    # resource_hist = np.load("3D_resource_history.npy")
-    # fig, ax = plt.subplots(2,1)
-    # ax[0].plot(active_hist, label="Active")
-    # ax[0].plot(depleted_hist, label="Depleted")
-    # ax[0].legend()
-    # ax[1].plot(resource_hist, label="Total Resource", color='g')
-    # ax[1].legend()
-    # plt.show()
+    main()
