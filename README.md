@@ -36,7 +36,7 @@ The included `ethics/` directory outlines this "Clay Covenant" in detail.
 
 We have designed this project to be accessible to everyone, regardless of your background. The best place to start is with our interactive tutorials.
 
-**>> [Start Here: The Grand Tour - Introduction to RUFT (Google Colab)](https://colab.research.google.com/drive/1l9NsiWO-inhVMr1eyWgl08taCHg2bdG3?usp=sharing) <<**
+**>> [Start Here: The Grand Tour - Introduction to RUFT (Google Colab)](https://colab.research.google.com/drive/15UzoeLwGk6Jok-0BTh-eiMkrX3XibmB_?usp=sharing) <<**
 
 This introductory notebook requires no setup and will guide you to all other resources, including:
 *   **Tutorial 1:** Run your first simulation.
